@@ -473,6 +473,21 @@ once to specify an arbitrary number of proxies. Should one proxy fail, \fBcntlm\
 next one. The connect request fails only if the whole list of proxies is scanned and (for each request) and
 found to be invalid. Command-line takes precedence over the configuration file.
 
+.ne 2
+.TP
+.B ProxyMode failover|roundrobin
+Proxy selection mode. \fIfailover\fP (default) tries proxies sequentially until one works, then uses it for all
+subsequent connections until it fails. \fIroundrobin\fP distributes connections across available proxies using
+round-robin algorithm with load balancing. In roundrobin mode, connections are distributed evenly and failed
+proxies are temporarily avoided.
+
+.ne 2
+.TP
+.B ProxyMaxConn <number>
+Maximum concurrent connections per proxy (default: 10, range: 1-1000). This option is only used in
+roundrobin mode to limit the number of connections to each parent proxy. When a proxy reaches this limit,
+new connections are routed to other available proxies.
+
 .TP
 .B NoProxy <pattern1>, <pattern2>, ...
 Avoid parent proxy for these host names. All matching URL's will be proxied \fIdirectly\fP by \fBcntlm\fP as a

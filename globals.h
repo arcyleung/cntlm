@@ -39,6 +39,14 @@ extern int serialize;
 extern int scanner_plugin;
 extern long scanner_plugin_maxsize;
 
+/* Proxy load balancing configuration */
+extern int proxy_mode;				/* ProxyMode: 0=failover, 1=roundrobin */
+extern int proxy_max_connections;			/* ProxyMaxConn: max connections per proxy */
+
+/* Proxy mode constants */
+#define PROXY_MODE_FAILOVER	0
+#define PROXY_MODE_ROUNDROBIN	1
+
 extern plist_t threads_list;
 extern pthread_mutex_t threads_mtx;
 

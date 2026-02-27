@@ -24,6 +24,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
+#include <limits.h>
 
 #include "proxy.h"
 #include "globals.h"
@@ -40,19 +42,7 @@
  * Proxy types defined by PAC specification. Used in proxy_t to
  * specify proxy type.
  */
-enum proxy_type_t { DIRECT, PROXY };
 
-typedef struct {
-	enum proxy_type_t type;
-	char hostname[64];
-	int port;
-	struct auth_s creds;
-	struct addrinfo *addresses;
-	int resolved;
-} proxy_t;
-
-typedef struct proxylist_s *proxylist_t;
-typedef const struct proxylist_s *proxylist_const_t;
 struct proxylist_s {
 	unsigned long key;
 	proxy_t *proxy;
@@ -86,6 +76,10 @@ proxylist_t parent_list = NULL;
 
 unsigned long parent_curr = 0;
 pthread_mutex_t parent_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Round-robin state */
+static unsigned long rr_last_proxy_key = 0;	/* Last proxy used in round-robin */
+static pthread_mutex_t rr_mtx = PTHREAD_MUTEX_INITIALIZER;
 
 #if config_gss == 1
 proxy_t *curr_proxy;
@@ -136,6 +130,21 @@ proxy_t *proxylist_get(proxylist_const_t list, const unsigned long key) {
 }
 
 /*
+ * Find the key associated with a proxy pointer
+ */
+unsigned long proxylist_get_key_by_proxy(proxylist_const_t list, proxy_t *proxy) {
+	proxylist_const_t t = list;
+
+	while (t) {
+		if (t->proxy == proxy)
+			return t->key;
+		t = t->next;
+	}
+
+	return 0;
+}
+
+/*
  * Return the pointer of the element next to the one associated with the key.
  * If it reaches the end of list or key is not found it returns the first element.
  */
@@ -177,6 +186,7 @@ void proxylist_free(proxylist_t list, int free_proxy) {
 		if (free_proxy) {
 			proxy_t *proxy = list->proxy;
 			freeaddrinfo(proxy->addresses);
+			pthread_mutex_destroy(&proxy->stats_mtx);
 			free(proxy);
 		}
 		free(list);
@@ -226,6 +236,11 @@ int parent_add(const char *parent, int port) {
 	proxy->port = port;
 	proxy->resolved = 0;
 	proxy->addresses = NULL;
+	
+	/* Initialize statistics and mutex */
+	memset(&proxy->stats, 0, sizeof(proxy_stats_t));
+	pthread_mutex_init(&proxy->stats_mtx, NULL);
+	
 	parent_list = proxylist_add(parent_list, ++parent_count, proxy);
 
 	free(spec);
@@ -320,6 +335,10 @@ paclist_t paclist_create(const char *pacp_str) {
 			if (p == NULL) {
 				proxy = (proxy_t *)zmalloc(sizeof(proxy_t));
 				proxy->type = DIRECT;
+				
+				/* Initialize statistics and mutex */
+				memset(&proxy->stats, 0, sizeof(proxy_stats_t));
+				pthread_mutex_init(&proxy->stats_mtx, NULL);
 				
 				pthread_mutex_lock(&parent_mtx);
 				++parent_count;
@@ -444,9 +463,29 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 		proxycurr = proxylist->key;
 	}
 
+	/* Select proxy based on mode */
+	if (proxy_mode == PROXY_MODE_ROUNDROBIN && !pac_initialized) {
+		/* Round-robin mode for parent proxies */
+		proxy = select_proxy_roundrobin(proxylist, proxycount);
+		if (!proxy) {
+			syslog(LOG_ERR, "No available proxy in round-robin mode\n");
+			return -1;
+		}
+		proxycurr = proxylist_get_key_by_proxy(proxylist, proxy);
+		if (proxycurr == 0) {
+			proxycurr = proxylist->key;
+		}
+	} else {
+		/* Failover mode (default) or PAC mode */
+		proxy = NULL;
+	}
+
 	do {
-		pthread_mutex_lock(&parent_mtx);
-		proxy = proxylist_get(proxylist, proxycurr);
+		/* In failover mode, get proxy by proxycurr; in round-robin, proxy is already set */
+		if (proxy_mode != PROXY_MODE_ROUNDROBIN || pac_initialized) {
+			pthread_mutex_lock(&parent_mtx);
+			proxy = proxylist_get(proxylist, proxycurr);
+		}
 		if (proxy &&
 			proxy->type == PROXY &&
 			proxy->resolved == 0) {
@@ -458,10 +497,19 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 				syslog(LOG_ERR, "Cannot resolve proxy %s\n", proxy->hostname);
 			}
 		}
-		pthread_mutex_unlock(&parent_mtx);
+		
+		/* Unlock mutex if we locked it */
+		if (proxy_mode != PROXY_MODE_ROUNDROBIN || pac_initialized) {
+			pthread_mutex_unlock(&parent_mtx);
+		}
 
 		if (proxy && proxy->type == DIRECT)
 			return -2;
+
+		/* Track connection start */
+		if (proxy && proxy->type == PROXY) {
+			proxy_connection_start(proxy);
+		}
 
 		i = -1;
 		if (proxy && proxy->resolved != 0)
@@ -471,6 +519,14 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 		 * Resolve or connect failed?
 		 */
 		if (i < 0) {
+			/* Track connection failure */
+			if (proxy && proxy->type == PROXY) {
+				pthread_mutex_lock(&proxy->stats_mtx);
+				proxy->stats.failed_connections++;
+				proxy->stats.last_failure = time(NULL);
+				pthread_mutex_unlock(&proxy->stats_mtx);
+				proxy_connection_end(proxy);
+			}
 			p = proxylist_get_next(proxylist, proxycurr);
 			if (p && p->proxy) {
 				proxycurr = p->key;
@@ -513,6 +569,123 @@ int proxy_connect(struct auth_s *credentials, const char* url, const char* hostn
 		copy_auth(credentials, g_creds, /* fullcopy */ !ntlmbasic);
 
 	return i;
+}
+
+/*
+ * Connection management functions for round-robin load balancing
+ */
+
+/*
+ * Increment connection count for a proxy
+ */
+void proxy_connection_start(proxy_t *proxy) {
+	if (!proxy || proxy->type == DIRECT)
+		return;
+	
+	pthread_mutex_lock(&proxy->stats_mtx);
+	proxy->stats.current_connections++;
+	proxy->stats.total_connections++;
+	pthread_mutex_unlock(&proxy->stats_mtx);
+}
+
+/*
+ * Decrement connection count for a proxy
+ */
+void proxy_connection_end(proxy_t *proxy) {
+	if (!proxy || proxy->type == DIRECT)
+		return;
+	
+	pthread_mutex_lock(&proxy->stats_mtx);
+	if (proxy->stats.current_connections > 0)
+		proxy->stats.current_connections--;
+	pthread_mutex_unlock(&proxy->stats_mtx);
+}
+
+/*
+ * Check if proxy is available for new connections
+ */
+int proxy_is_available(proxy_t *proxy) {
+	if (!proxy || proxy->type == DIRECT)
+		return 0;
+	
+	pthread_mutex_lock(&proxy->stats_mtx);
+	
+	/* Check connection limit */
+	if (proxy->stats.current_connections >= proxy_max_connections) {
+		pthread_mutex_unlock(&proxy->stats_mtx);
+		return 0;
+	}
+	
+	/* Check if proxy failed recently (30 second cooldown) */
+	time_t now = time(NULL);
+	if (proxy->stats.last_failure > 0 && (now - proxy->stats.last_failure) < 30) {
+		pthread_mutex_unlock(&proxy->stats_mtx);
+		return 0;
+	}
+	
+	pthread_mutex_unlock(&proxy->stats_mtx);
+	return 1;
+}
+
+/*
+ * Select proxy using round-robin algorithm with load balancing
+ */
+proxy_t *select_proxy_roundrobin(proxylist_const_t proxylist, int proxycount) {
+	proxylist_const_t start_proxy;
+	proxylist_const_t current;
+	proxy_t *selected = NULL;
+	proxy_t *least_loaded = NULL;
+	int min_connections = INT_MAX;
+	
+	if (!proxylist || proxycount <= 0)
+		return NULL;
+	
+	pthread_mutex_lock(&rr_mtx);
+	
+	/* Start from the next proxy after last used */
+	start_proxy = proxylist_get_next(proxylist, rr_last_proxy_key);
+	current = start_proxy;
+	
+	/* First pass: try to find an available proxy in round-robin order */
+	do {
+		proxy_t *proxy = current->proxy;
+		
+		if (proxy->type == PROXY && proxy_is_available(proxy)) {
+			selected = proxy;
+			rr_last_proxy_key = current->key;
+			break;
+		}
+		
+		/* Track least loaded proxy as fallback */
+		if (proxy->type == PROXY) {
+			pthread_mutex_lock(&proxy->stats_mtx);
+			if (proxy->stats.current_connections < min_connections) {
+				min_connections = proxy->stats.current_connections;
+				least_loaded = proxy;
+			}
+			pthread_mutex_unlock(&proxy->stats_mtx);
+		}
+		
+		current = proxylist_get_next(proxylist, current->key);
+	} while (current != start_proxy);
+	
+	/* If no available proxy found, use least loaded as fallback */
+	if (!selected && least_loaded) {
+		selected = least_loaded;
+		/* Find the proxylist entry for the least loaded proxy */
+		current = proxylist;
+		while (current) {
+			if (current->proxy == selected) {
+				rr_last_proxy_key = current->key;
+				break;
+			}
+			current = current->next;
+		}
+	}
+	
+	pthread_mutex_unlock(&rr_mtx);
+	
+	return selected;
 }
 
 /*

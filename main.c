@@ -84,6 +84,10 @@ int serialize = 0;
 int scanner_plugin = 0;
 long scanner_plugin_maxsize = 0;
 
+/* Proxy load balancing configuration */
+int proxy_mode = PROXY_MODE_FAILOVER;	/* Default to failover for backward compatibility */
+int proxy_max_connections = 10;		/* Default max connections per proxy */
+
 /*
  * List of finished threads. Each forward_request() thread adds itself to it when
  * finished. Main regularly joins and removes all tid's in there.
@@ -1250,6 +1254,38 @@ int main(int argc, char **argv) {
 		if (!scanner_plugin_maxsize && strlen(tmp)) {
 			scanner_plugin = 1;
 			scanner_plugin_maxsize = atoi(tmp);
+		}
+		free(tmp);
+
+		/*
+		 * Check for proxy load balancing mode
+		 */
+		tmp = zmalloc(MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "ProxyMode", tmp, MINIBUF_SIZE)
+		if (strlen(tmp)) {
+			if (!strcasecmp("roundrobin", tmp)) {
+				proxy_mode = PROXY_MODE_ROUNDROBIN;
+			} else if (!strcasecmp("failover", tmp)) {
+				proxy_mode = PROXY_MODE_FAILOVER;
+			} else {
+				syslog(LOG_WARNING, "Invalid ProxyMode '%s', using failover\n", tmp);
+				proxy_mode = PROXY_MODE_FAILOVER;
+			}
+		}
+		free(tmp);
+
+		/*
+		 * Check for proxy max connections
+		 */
+		tmp = zmalloc(MINIBUF_SIZE);
+		CFG_DEFAULT(cf, "ProxyMaxConn", tmp, MINIBUF_SIZE)
+		if (strlen(tmp)) {
+			int max_conn = atoi(tmp);
+			if (max_conn > 0 && max_conn <= 1000) {
+				proxy_max_connections = max_conn;
+			} else {
+				syslog(LOG_WARNING, "Invalid ProxyMaxConn '%s', using default %d\n", tmp, proxy_max_connections);
+			}
 		}
 		free(tmp);
 
